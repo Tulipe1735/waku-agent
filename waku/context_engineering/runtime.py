@@ -11,7 +11,7 @@ from waku.tools.registry import Tool
 
 from .assembly import assemble
 from .compaction import checkpoint_trigger, compact_history, compile_continuation
-from .notebook import read_checkpoint
+from .continuation import ContinuationStore
 from .packet import ContextPacket, token_length
 
 
@@ -19,6 +19,7 @@ class ContextRuntime:
     def __init__(self, settings, client, tools, *, summarizer=None):
         self.settings, self.client, self.tools = settings, client, tools
         self.summarizer = summarizer
+        self.store = ContinuationStore(settings.home / "continuations")
         self.notebook = self.coordinator = None
         self._turns, self._warnings, self._checkpoint_rows = {}, {}, {}
         self._session = None
@@ -35,6 +36,7 @@ class ContextRuntime:
             )
             for tool in make_tools(self.notebook):
                 tools.register(tool)
+        if settings.context_continuation:
             tools.register(
                 Tool(
                     "context_checkpoint",
@@ -105,46 +107,40 @@ class ContextRuntime:
         if notify:
             notify("context_warning", {"task_id": task, "reason": reason.split(":")[0]})
 
-    def _previous(self, task):
-        """Latest committed task state, embedded in the notebook checkpoint chain."""
-        if not self.notebook:
-            return None
-        try:
-            checkpoint = self.notebook.read(task).get("checkpoint")
-        except FileNotFoundError:
-            return None
-        if not checkpoint or not checkpoint.get("continuation"):
-            return None
-        return read_checkpoint(checkpoint["continuation"])
-
     # 每次调用前拼装上下文
     def prepare(self, session, user_message, notify=None):
         self._session, self._notify = session, notify
         task = self.task_id(session.session_id)
         window = self.settings.history_turns * 2
-        start = self._checkpoint_rows.get(task, 0)
+        start = self._checkpoint_rows.get(task, 0) if self.settings.context_continuation else 0
         # Only post-checkpoint conversation needs replay; a reopened session falls
         # back to its bounded tail because its in-memory offset is unknown.
         history = session.history[start:]
         history = history[-window:] if window else []
         messages, omitted = compact_history(history + [{"role": "user", "content": user_message}])
         candidates: list[ContextPacket] = []
+        checkpoint_id = None
         if task in self._aggregations:
             candidates.append(self._aggregations[task])
         try:
+            if self.settings.context_continuation:
+                previous = self.store.latest(task)
+                if previous:
+                    candidates.append(previous)
+                    checkpoint_id = previous.id
             if self.notebook:
-                candidates.extend(
-                    self.notebook.resume_context(
-                        task, query=user_message, include_continuation=True
+                try:
+                    candidates.extend(
+                        self.notebook.resume_context(
+                            task,
+                            query=user_message,
+                            include_continuation=not self.settings.context_continuation,
+                        )
                     )
-                )
-        except FileNotFoundError:
-            pass
+                except FileNotFoundError:
+                    pass
         except Exception as exc:
             self._warn(session, f"Restore failed: {type(exc).__name__}", notify)
-        checkpoint_id = next(
-            (packet.id for packet in candidates if packet.kind == "continuation"), None
-        )
         assembly = assemble(candidates)
         data: dict[str, Any] = {}
         if assembly.packets:
@@ -181,7 +177,7 @@ class ContextRuntime:
     # 当前任务做到某个阶段 → 保存一个恢复点
     def checkpoint(self, session, state=None, event="milestone", notify=None):
         task = self.task_id(session.session_id)
-        previous = self._previous(task)
+        previous = self.store.latest(task) if self.settings.context_continuation else None
         state = dict(state or {})
         state["task_id"] = task
         if not state.get("objective") and not previous:
@@ -204,8 +200,23 @@ class ContextRuntime:
                 title=continuation.metadata["objective"],
                 phase=continuation.metadata.get("current_phase", "init"),
             )
-            # The notebook copy is the only recovery source now, so bound the
-            # state before embedding it instead of truncating after the write.
+            checkpoint = self.notebook.checkpoint(
+                task,
+                continuation=continuation.to_dict(),
+                phase=continuation.metadata.get("current_phase", "init"),
+                source_refs=[{"type": "conversation", "ref": session.session_id}],
+            )
+            # Each side names the other immutable checkpoint. Older links are
+            # already reachable through parent IDs, so keep only the current ref.
+            continuation.metadata["artifacts"] = [
+                ref for ref in continuation.metadata["artifacts"] if not ref.startswith("notebook:")
+            ]
+            continuation.metadata["artifacts"].append(
+                f"notebook:{task}:{checkpoint['checkpoint_id']}"
+            )
+            continuation.source_refs = [
+                ref for ref in continuation.source_refs if not ref.startswith("notebook:")
+            ] + [f"notebook:{task}:{checkpoint['checkpoint_id']}"]
             if token_length(continuation.to_dict()) > 3000:
                 continuation.content = continuation.metadata["objective"]
                 continuation.token_count = token_length(continuation.content)
@@ -214,17 +225,13 @@ class ContextRuntime:
                     session, "Checkpoint exceeds recovery budget: previous state retained", notify
                 )
                 return previous
-            checkpoint = self.notebook.checkpoint(
-                task,
-                continuation=continuation.to_dict(),
-                phase=continuation.metadata.get("current_phase", "init"),
-                source_refs=[{"type": "conversation", "ref": session.session_id}],
-            )
             if notify:
                 notify(
                     "notebook_checkpoint",
                     {"task_id": task, "checkpoint_id": checkpoint.get("checkpoint_id")},
                 )
+        if self.settings.context_continuation:
+            self.store.save(continuation)
         self._turns[task] = 0
         self._checkpoint_rows[task] = len(session.history)
         self._warnings.pop(task, None)
@@ -267,7 +274,7 @@ class ContextRuntime:
             estimated_tokens=token_length(session.history[self._checkpoint_rows.get(task, 0) :]),
             event=event,
         )
-        if reason and self.notebook:
+        if reason and (self.settings.context_continuation or self.notebook):
             try:
                 self.checkpoint(session, event=reason, notify=notify)
             except Exception as exc:
@@ -289,7 +296,7 @@ class ContextRuntime:
             "schema_version",
         } & state.keys():
             raise ValueError("Checkpoint identity is controlled by code")
-        previous = self._previous(self.task_id(self._session.session_id))
+        previous = self.store.latest(self.task_id(self._session.session_id))
         if previous:
             for field in ("constraints", "open_questions", "next_actions"):
                 if field in state and not set(previous.metadata.get(field, [])) <= set(
@@ -326,6 +333,7 @@ class ContextRuntime:
             result.to_dict() if result else {"warning": "Checkpoint not saved"}, ensure_ascii=False
         )
 
+    # Subagent
     def _delegate_tool(self, subtasks):
         from .delegation import DelegationPlan, Subtask
 
@@ -340,6 +348,7 @@ class ContextRuntime:
         self.aggregate(self._session, result, self._notify)
         return json.dumps(result.to_dict(), ensure_ascii=False)
 
+    # 聚合 subagent 的结果，保存到当前任务的 checkpoint
     def aggregate(self, session, aggregation, notify=None):
         """Only the parent commits worker proposals; conflicts stay unresolved."""
         task = self.task_id(session.session_id)
@@ -387,8 +396,8 @@ class ContextRuntime:
                             "metadata": {"status": "open", "phase": "research"},
                         },
                     )
-            if self.notebook:
-                previous = self._previous(task)
+            if self.settings.context_continuation:
+                previous = self.store.latest(task)
                 questions = list(previous.metadata.get("open_questions", [])) if previous else []
                 questions.extend(str(x) for x in value.get("uncertainties", []))
                 risks = list(previous.metadata.get("risks", [])) if previous else []
@@ -403,6 +412,8 @@ class ContextRuntime:
                     event="aggregation",
                     notify=notify,
                 )
+            elif self.notebook:
+                self.notebook.checkpoint(task, phase="research")
             if notify:
                 notify(
                     "delegation_aggregation",

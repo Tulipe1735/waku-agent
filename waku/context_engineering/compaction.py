@@ -1,4 +1,7 @@
-"""Explicit checkpoint compilation and whole-turn trimming, without prompt middleware."""
+"""
+Compaction
+
+Explicit checkpoint compilation and whole-turn trimming, without prompt middleware."""
 
 from __future__ import annotations
 
@@ -7,7 +10,7 @@ import hashlib
 import json
 from dataclasses import dataclass, field
 
-from .notebook import validate_checkpoint
+from .continuation import validate_checkpoint
 from .packet import ContextPacket, token_length
 
 
