@@ -98,6 +98,17 @@ class Session:
         bug from the first live test)."""
         record = reply
         if tool_calls:
+            import hashlib
+            # Notebook/worker bodies stay in their project stores. Do not feed
+            # their raw text to cross-task memory consolidation via chat logs.
+            tool_calls = [
+                {**call, "args": "[project data]", "output": "sha256:" + hashlib.sha256(
+                    str(call["output"]).encode("utf-8")).hexdigest()}
+                if call["tool"].startswith("notebook_") or call["tool"] in {
+                    "context_checkpoint", "delegate_subtasks"} else call
+                for call in tool_calls
+            ]
+        if tool_calls:
             summary = "; ".join(f"{c['tool']}({c['args']}) -> {c['output']}" for c in tool_calls)
             record = f"{reply}\n[tools used: {summary}]"
         self.history.append({"role": "user", "content": user_message})

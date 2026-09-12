@@ -19,9 +19,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any
-
-import anthropic
+from typing import Any, Protocol
 
 from waku.tools.registry import ToolRegistry
 
@@ -29,6 +27,13 @@ from waku.tools.registry import ToolRegistry
 # them — without either being wired into the loop's logic.
 LoopEvent = dict[str, Any]
 Observer = Callable[[str, LoopEvent], None]
+
+
+class ModelClient(Protocol):
+    """The shared Messages seam supports native, compatible and test clients."""
+
+    @property
+    def messages(self) -> Any: ...
 
 
 @dataclass
@@ -39,7 +44,7 @@ class LoopResult:
 
 
 def run_loop(
-    client: anthropic.Anthropic,
+    client: ModelClient,
     model: str,
     system: str,
     messages: list[dict],
@@ -48,6 +53,7 @@ def run_loop(
     max_tokens: int = 2048,
     observer: Observer | None = None,
     stream: bool = False,
+    tool_result_limit: int | None = None,
 ) -> LoopResult:
     """Run one agent turn. `messages` is mutated in place — after the call it
     contains the full working memory of the turn (assistant thoughts, tool
@@ -59,6 +65,7 @@ def run_loop(
     notify = observer or (lambda kind, ev: None)
     result = LoopResult(reply="")
     can_stream = stream and hasattr(client.messages, "stream")
+    observed_results = []
 
     for iteration in range(1, max_iterations + 1):
         result.iterations = iteration
@@ -68,8 +75,11 @@ def run_loop(
         if can_stream:
             try:
                 with client.messages.stream(
-                    model=model, system=system, messages=messages,
-                    tools=tools.schemas(), max_tokens=max_tokens,
+                    model=model,
+                    system=system,
+                    messages=messages,
+                    tools=tools.schemas(),
+                    max_tokens=max_tokens,
                 ) as s:
                     for delta in s.text_stream:
                         notify("text", {"delta": delta})
@@ -84,8 +94,14 @@ def run_loop(
                 tools=tools.schemas(),
                 max_tokens=max_tokens,
             )
-        notify("llm", {"iteration": iteration, "stop_reason": response.stop_reason,
-                       "usage": {"in": response.usage.input_tokens, "out": response.usage.output_tokens}})
+        notify(
+            "llm",
+            {
+                "iteration": iteration,
+                "stop_reason": response.stop_reason,
+                "usage": {"in": response.usage.input_tokens, "out": response.usage.output_tokens},
+            },
+        )
 
         # the assistant's turn (text and/or tool requests) joins working memory
         messages.append({"role": "assistant", "content": response.content})
@@ -104,11 +120,20 @@ def run_loop(
             event = {"tool": call.name, "args": call.input, "output": output}
             result.tool_calls.append(event)
             notify("tool", event)
-            tool_results.append(
-                {"type": "tool_result", "tool_use_id": call.id, "content": output}
-            )
+            block = {"type": "tool_result", "tool_use_id": call.id, "content": output}
+            tool_results.append(block)
+            if tool_result_limit is not None:
+                from waku.context_engineering.compaction import bounded_tool_result
+                observed_results.append((block, output))
+                # Rebalance observations without splitting any call/result pair.
+                # Full raw outputs remain in LoopResult and the normal tool trace.
+                allowance = max(1, min(tool_result_limit, 6000 // len(observed_results)))
+                for observed, raw in observed_results:
+                    observed["content"] = bounded_tool_result(raw, allowance)
         messages.append({"role": "user", "content": tool_results})
 
     # ---- guardrail 2: ran out of iterations
-    result.reply = "(I hit my iteration limit before finishing — try breaking the request into smaller steps.)"
+    result.reply = (
+        "(I hit my iteration limit before finishing — try breaking the request into smaller steps.)"
+    )
     return result

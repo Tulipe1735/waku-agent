@@ -32,6 +32,11 @@ class Waku:
         self.mcp_bridge = getattr(self.tools, "mcp_bridge", None)
         self.session = Session(self.settings, memory=self.memory)
         self.tracer = Tracer(self.settings)
+        self.context = None
+        if (self.settings.context_continuation or self.settings.context_notebook
+                or self.settings.context_subagents):
+            from waku.context_engineering.runtime import ContextRuntime
+            self.context = ContextRuntime(self.settings, self.client, self.tools)
 
     def close(self) -> None:
         """Release external resources (MCP subprocesses). Called when the
@@ -104,6 +109,8 @@ class Waku:
             }
             self.session.add_exchange(user_message, result.reply, tool_calls=result.tool_calls,
                                       source=source, meta=meta)
+            if self.context is not None:
+                self.context.after_turn(self.session, result, notify)
             if self.memory is not None:
                 self.memory.maybe_consolidate(notify=notify)
                 self.memory.export_markdown()   # keep MEMORY.md in sync
@@ -122,6 +129,8 @@ class Waku:
         # come back via the retrieval gate + episodic memory when relevant.
         window = self.settings.history_turns * 2
         messages = self.session.history[-window:] + [{"role": "user", "content": user_message}]
+        if self.context is not None:
+            messages = self.context.prepare(self.session, user_message, notify)
 
         return run_loop(
             client=self.client,
@@ -133,6 +142,7 @@ class Waku:
             max_tokens=self.settings.max_tokens,
             observer=notify,
             stream=stream,
+            tool_result_limit=2000 if self.context is not None else None,
         )
 
     def _respond_via_graph(self, user_message: str, notify, stream: bool) -> LoopResult | None:

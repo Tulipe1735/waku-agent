@@ -117,6 +117,15 @@ class Tracer:
     def event(self, kind: str, event: dict) -> None:
         if kind == "text":
             return  # streaming token deltas are for the live UI, not the trace
+        if kind == "tool" and (event.get("tool", "").startswith("notebook_")
+                or event.get("tool") in {"context_checkpoint", "delegate_subtasks"}):
+            import hashlib
+            # New project artifacts are private data. Existing trace consumers
+            # keep the event shape, but receive references rather than bodies.
+            encoded = json.dumps(event, ensure_ascii=False, default=str).encode("utf-8")
+            event = {"tool": event["tool"], "sha256": hashlib.sha256(encoded).hexdigest(),
+                     "bytes": len(encoded), "args": "[project data redacted]",
+                     "output": "[project data redacted]"}
         if kind == "llm":
             self._record_usage(event)
             # stamp WHICH brain answered — in a multi-model world (shootouts,

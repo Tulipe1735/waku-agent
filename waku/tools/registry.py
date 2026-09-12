@@ -56,3 +56,30 @@ class ToolRegistry:
             return tool.fn(**args)
         except Exception as exc:  # surface, don't crash — the model can retry
             return f"Error running {name}: {exc}"
+
+    def scoped(self, allowed_tools, *, before_execute=None) -> ToolRegistry:
+        """Copy explicit capabilities, checking revocation before each invocation.
+
+        This does not infer read/write safety from a name. The caller must authorize
+        capabilities and supply isolated implementations for any write tools.
+        """
+        names = set(allowed_tools)
+        unknown = names - self._tools.keys()
+        if unknown:
+            raise ValueError(f"Unknown scoped tools: {sorted(unknown)}")
+        scoped = ToolRegistry()
+        for name in sorted(names):
+            tool = self._tools[name]
+
+            def bind(selected):
+                def invoke(_notify=None, **kwargs):
+                    if before_execute is not None:
+                        before_execute()
+                    if selected.wants_notify:
+                        return selected.fn(**kwargs, _notify=_notify)
+                    return selected.fn(**kwargs)
+                return invoke
+
+            scoped.register(Tool(tool.name, tool.description, tool.input_schema,
+                                 bind(tool), wants_notify=True))
+        return scoped
