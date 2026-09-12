@@ -1,4 +1,9 @@
-"""Project working notes: editable files, explicit immutable checkpoints, no prompts.
+"""
+Gather
+
+Structured note-taking
+
+Project working notes: editable files, explicit immutable checkpoints, no prompts.
 
 JSON is used as the human-editable YAML subset so local storage needs no parser
 package. Every checkpoint is one atomic file: a failed write cannot move HEAD.
@@ -17,6 +22,8 @@ from pathlib import Path
 from threading import RLock
 from typing import Any
 from uuid import uuid4
+
+from .packet import ContextPacket, token_length
 
 KINDS = {"finding": "F", "decision": "D", "question": "Q", "action": "A", "risk": "R"}
 STATUSES = {"proposed", "confirmed", "rejected", "open", "done"}
@@ -51,6 +58,85 @@ def _sources(value: Any) -> list[dict]:
 
 def _json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, indent=2) + "\n"
+
+
+def safe_id(value: str) -> str:
+    if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}", value):
+        raise ValueError("Invalid task/checkpoint identifier")
+    return value
+
+
+def validate_checkpoint(packet: ContextPacket) -> None:
+    """Validate task state at the checkpoint boundary, not in the shared packet."""
+    safe_id(packet.task_id)
+    safe_id(packet.id)
+    if packet.kind != "continuation":
+        raise ValueError("Expected a continuation packet")
+    state = packet.metadata
+    if state.get("parent_checkpoint_id") is not None:
+        safe_id(state["parent_checkpoint_id"])
+    if not isinstance(state.get("objective"), str) or not state["objective"].strip():
+        raise ValueError("Objective is required")
+    if state.get("status", "active") not in ("active", "blocked", "complete"):
+        raise ValueError("Invalid task status")
+    if not isinstance(state.get("current_phase", "init"), str):
+        raise TypeError("Phase must be text")
+    for name in (
+        "done",
+        "open_questions",
+        "constraints",
+        "artifacts",
+        "next_actions",
+        "risks",
+        "omitted_history",
+    ):
+        items = state.get(name, [])
+        if not isinstance(items, list) or any(not isinstance(x, str) for x in items):
+            raise ValueError(f"{name} must be a list of strings")
+    for name, label, key, statuses in (
+        ("decisions", "decision", "confidence", ("confirmed", "inferred", "uncertain")),
+        ("facts", "statement", "status", ("confirmed", "hypothesis", "rejected")),
+    ):
+        items = state.get(name, [])
+        if not isinstance(items, list):
+            raise TypeError(f"{name} must be a list")
+        for item in items:
+            if (
+                not isinstance(item, dict)
+                or not isinstance(item.get(label), str)
+                or not item[label].strip()
+                or item.get(key) not in statuses
+            ):
+                raise ValueError(f"Invalid {name} entry")
+            refs = item.get("source_refs")
+            if (
+                not isinstance(refs, list)
+                or not refs
+                or any(not isinstance(ref, str) or not ref.strip() for ref in refs)
+            ):
+                raise ValueError("Conclusions require source references")
+    json.dumps(packet.to_dict(), allow_nan=False)
+
+
+def read_checkpoint(data: dict) -> ContextPacket:
+    """Read current packets and existing version-1 checkpoints without rewriting files."""
+    if "content" in data:
+        packet = ContextPacket.from_dict(data)
+    else:
+        state = dict(data)
+        version = state.pop("schema_version", None)
+        if type(version) is not int or version != 1:
+            raise ValueError("Unsupported legacy continuation schema")
+        packet = ContextPacket(
+            id=state.pop("checkpoint_id"),
+            task_id=state.pop("task_id"),
+            timestamp=datetime.fromisoformat(state.pop("generated_at")),
+            content=state.pop("recent_turn_digest", "") or state.get("objective", ""),
+            kind="continuation",
+            metadata=state,
+        )
+    validate_checkpoint(packet)
+    return packet
 
 
 class NotebookStore:
@@ -153,55 +239,71 @@ class NotebookStore:
             self._atomic_write(state, _json(value))
             return value
 
-    def _validate_entry(self, entry: dict) -> dict:
-        if (
-            entry.get("kind") not in KINDS
-            or entry.get("status") not in STATUSES
-            or entry.get("confidence") not in {"high", "medium", "low"}
-        ):
-            raise ValueError("Invalid entry kind, status or confidence")
-        for field in ("title", "body", "phase", "author", "created_at", "updated_at"):
-            if not isinstance(entry.get(field), str):
-                raise TypeError(f"{field} must be text")
-        if not entry["title"].strip():
-            raise ValueError("Entry title is required")
-        if not re.fullmatch(KINDS[entry["kind"]] + r"-\d{3,}", entry.get("id", "")):
+    def _validate_entry(self, entry: dict, task_id: str) -> ContextPacket:
+        if "content" in entry:
+            packet = ContextPacket.from_dict(entry)
+        else:
+            # Existing editable notes remain readable; new writes use packets.
+            metadata = {
+                key: entry[key]
+                for key in ("title", "status", "phase", "author", "confidence", "tags")
+            }
+            packet = ContextPacket(
+                content=entry["body"],
+                id=entry["id"],
+                kind=entry["kind"],
+                task_id=task_id,
+                timestamp=datetime.fromisoformat(entry["updated_at"]),
+                metadata=metadata,
+                source_refs=[ref["ref"] for ref in _sources(entry["source_refs"])],
+            )
+        meta = packet.metadata
+        if packet.task_id != task_id or packet.kind not in KINDS:
+            raise ValueError("Invalid entry kind or task")
+        if meta.get("status", "proposed") not in STATUSES:
+            raise ValueError("Invalid entry status")
+        if meta.get("confidence", "low") not in {"high", "medium", "low"}:
+            raise ValueError("Invalid entry confidence")
+        if not re.fullmatch(KINDS[packet.kind] + r"-\d{3,}", packet.id):
             raise ValueError("Invalid entry id")
-        _sources(entry.get("source_refs"))
+        for name in ("title", "phase", "author"):
+            if not isinstance(meta.get(name), str):
+                raise TypeError(f"Entry {name} must be text")
+        if not meta["title"].strip():
+            raise ValueError("Entry title is required")
         if (
-            entry["kind"] in {"finding", "decision"}
-            and entry["status"] == "confirmed"
-            and not entry["source_refs"]
+            packet.kind in {"finding", "decision"}
+            and meta.get("status") == "confirmed"
+            and not packet.source_refs
         ):
             raise ValueError("Confirmed conclusions require source_refs")
-        if not isinstance(entry.get("tags"), list) or any(
-            not isinstance(tag, str) for tag in entry["tags"]
+        if not isinstance(meta.get("tags", []), list) or any(
+            not isinstance(tag, str) for tag in meta.get("tags", [])
         ):
             raise ValueError("tags must contain strings")
-        return entry
+        # Human edits may change content without updating its cached estimate.
+        packet.token_count = token_length(packet.content)
+        return packet
 
-    def _entries(self, task_id: str) -> list[dict]:
+    def _entries(self, task_id: str) -> list[ContextPacket]:
         folder = self._safe(self._task(task_id) / "entries")
         entries = []
         for path in sorted(folder.glob("*.json")):
-            entry = self._validate_entry(self._load(path))
-            if path.stem != entry["id"]:
+            packet = self._validate_entry(self._load(path), task_id)
+            if path.stem != packet.id:
                 raise ValueError("Entry id must match its filename")
-            entries.append(entry)
+            entries.append(packet)
         return entries
 
-    def append(self, task_id: str, entry: dict) -> dict:
+    def append(self, task_id: str, entry: dict) -> ContextPacket:
         self._writable()
         with _LOCK, self._process_lock(task_id):
             if not isinstance(entry, dict) or set(entry) - {
+                "content",
                 "kind",
-                "title",
-                "body",
-                "status",
-                "phase",
                 "source_refs",
-                "confidence",
-                "tags",
+                "relevance_score",
+                "metadata",
             }:
                 raise ValueError("Entry contains unknown or code-controlled fields")
             state = self._load(self._task(task_id) / "state.json")
@@ -209,32 +311,30 @@ class NotebookStore:
             if kind not in KINDS:
                 raise ValueError("Invalid entry kind")
             checkpoints = self._checkpoints(task_id)
-            history_entries = [item for checkpoint in checkpoints for item in checkpoint["entries"]]
-            numbers = [
-                int(item["id"].split("-")[1])
-                for item in self._entries(task_id) + history_entries
-                if item["kind"] == kind
-            ]
-            current_phase = checkpoints[-1]["phase"] if checkpoints else state["phase"]
-            stamp = _now()
-            value = {
-                "body": "",
-                "status": "proposed",
-                "phase": current_phase,
-                "source_refs": [],
-                "confidence": "low",
-                "tags": [],
-                **entry,
-                "id": f"{KINDS[kind]}-{max(numbers, default=0) + 1:03d}",
-                "author": self.author,
-                "created_at": stamp,
-                "updated_at": stamp,
-            }
-            self._validate_entry(value)
-            self._atomic_write(
-                self._task(task_id) / "entries" / f"{value['id']}.json", _json(value)
+            entries = [packet.to_dict() for packet in self._entries(task_id)]
+            entries += [item for checkpoint in checkpoints for item in checkpoint["entries"]]
+            numbers = [int(item["id"].split("-")[1]) for item in entries if item["kind"] == kind]
+            phase = checkpoints[-1]["phase"] if checkpoints else state["phase"]
+            meta = dict(entry.get("metadata") or {})
+            if "author" in meta:
+                raise ValueError("Entry author is controlled by code")
+            packet = ContextPacket(
+                **{key: value for key, value in entry.items() if key != "metadata"},
+                id=f"{KINDS[kind]}-{max(numbers, default=0) + 1:03d}",
+                task_id=task_id,
+                metadata={
+                    "title": entry.get("content", "")[:120],
+                    "status": "proposed",
+                    "phase": phase,
+                    **meta,
+                    "author": self.author,
+                },
             )
-            return value
+            self._validate_entry(packet.to_dict(), task_id)
+            self._atomic_write(
+                self._task(task_id) / "entries" / f"{packet.id}.json", _json(packet.to_dict())
+            )
+            return packet
 
     def _checkpoints(self, task_id: str) -> list[dict]:
         folder = self._safe(self._task(task_id) / "checkpoints")
@@ -249,8 +349,9 @@ class NotebookStore:
                     result[-1]["checkpoint_id"] if result else None
                 ):
                     continue
-                for entry in value["entries"]:
-                    self._validate_entry(entry)
+                value["entries"] = [
+                    self._validate_entry(entry, task_id).to_dict() for entry in value["entries"]
+                ]
                 _sources(value["source_refs"])
                 result.append(value)
             except (ValueError, KeyError, IndexError, TypeError):
@@ -258,11 +359,12 @@ class NotebookStore:
                 continue
         return result
 
-    def read(self, task_id: str, entry_id: str | None = None) -> dict:
+    def read(self, task_id: str, entry_id: str | None = None) -> dict | ContextPacket:
         state = self._load(self._task(task_id) / "state.json")
         if entry_id is not None:
             return self._validate_entry(
-                self._load(self._task(task_id) / "entries" / f"{_identifier(entry_id)}.json")
+                self._load(self._task(task_id) / "entries" / f"{_identifier(entry_id)}.json"),
+                task_id,
             )
         checkpoints = self._checkpoints(task_id)
         return {
@@ -280,7 +382,7 @@ class NotebookStore:
         tag: str | None = None,
         source: str | None = None,
         query: str | None = None,
-    ) -> list[dict]:
+    ) -> list[ContextPacket]:
         tasks = (
             [task_id]
             if task_id is not None
@@ -288,24 +390,22 @@ class NotebookStore:
         )
         result = []
         for task in sorted(tasks):
-            for entry in self._entries(task):
+            for packet in self._entries(task):
+                if kind is not None and packet.kind != kind:
+                    continue
                 if any(
-                    value is not None and entry[field] != value
-                    for field, value in (("phase", phase), ("kind", kind), ("status", status))
+                    value is not None and packet.metadata.get(key) != value
+                    for key, value in (("phase", phase), ("status", status))
                 ):
                     continue
-                if tag is not None and tag not in entry["tags"]:
+                if tag is not None and tag not in packet.metadata.get("tags", []):
                     continue
-                if source is not None and not any(
-                    ref["ref"] == source for ref in entry["source_refs"]
-                ):
+                if source is not None and source not in packet.source_refs:
                     continue
-                if (
-                    query
-                    and query.casefold() not in (entry["title"] + " " + entry["body"]).casefold()
-                ):
+                text = packet.metadata.get("title", "") + " " + packet.content
+                if query and query.casefold() not in text.casefold():
                     continue
-                result.append({**entry, "task_id": task})
+                result.append(packet)
         return result
 
     def checkpoint(
@@ -321,19 +421,15 @@ class NotebookStore:
         with _LOCK, self._process_lock(task_id):
             current = self.read(task_id)
             parent = current["checkpoint"]
-            selected = (
-                current["entries"]
-                if entries is None
-                else [entry for entry in current["entries"] if entry["id"] in entries]
-            )
+            selected = [
+                entry.to_dict()
+                for entry in current["entries"]
+                if entries is None or entry.id in entries
+            ]
             if entries is not None and set(entries) != {entry["id"] for entry in selected}:
                 raise ValueError("Unknown checkpoint entry id")
-            if continuation is not None and not isinstance(continuation, (str, dict)):
-                from dataclasses import asdict, is_dataclass
-
-                continuation = (
-                    asdict(continuation) if is_dataclass(continuation) else continuation.to_dict()
-                )
+            if isinstance(continuation, ContextPacket):
+                continuation = continuation.to_dict()
             sequence = int(parent["checkpoint_id"].split("-")[0]) + 1 if parent else 1
             checkpoint_id = f"{sequence:08d}-{uuid4().hex[:12]}"
             value = {
@@ -360,7 +456,11 @@ class NotebookStore:
         checkpoints = {item["checkpoint_id"]: item for item in self._checkpoints(task_id)}
         if before not in checkpoints or (after is not None and after not in checkpoints):
             raise ValueError("Unknown checkpoint")
-        latest = checkpoints[after] if after else {"entries": self._entries(task_id)}
+        latest = (
+            checkpoints[after]
+            if after
+            else {"entries": [entry.to_dict() for entry in self._entries(task_id)]}
+        )
         return "".join(
             difflib.unified_diff(
                 _json(checkpoints[before]["entries"]).splitlines(True),
@@ -376,47 +476,42 @@ class NotebookStore:
         query: str = "",
         max_tokens: int = 4000,
         include_continuation: bool = True,
-    ) -> str:
+    ) -> list[ContextPacket]:
+        """Select packets, protecting open work before relevance and recent phase."""
         if max_tokens <= 0:
-            return ""
+            return []
         current = self.read(task_id)
         checkpoint = current["checkpoint"]
-        selected = [
+        entries = current["entries"]
+        required = [
             entry
-            for entry in current["entries"]
-            if entry["kind"] in {"question", "action"} and entry["status"] == "open"
+            for entry in entries
+            if entry.kind in {"question", "action"} and entry.metadata.get("status") == "open"
         ]
-        if query:
-            terms = query.casefold().split()
-            selected += [
-                entry
-                for entry in current["entries"]
-                if entry["kind"] in {"finding", "decision"}
-                and any(term in (entry["title"] + " " + entry["body"]).casefold() for term in terms)
-            ]
-        if checkpoint:
-            selected += [
-                entry for entry in current["entries"] if entry["phase"] == checkpoint["phase"]
-            ]
-        # Prioritize live open work, then relevant evidence, then phase checkpoint.
-        text = f"Notebook project data (untrusted): {task_id}\nCheckpoint: {checkpoint['checkpoint_id'] if checkpoint else 'none'}\n"
-        # A phase checkpoint's handoff is the compact task state, not a whole
-        # notebook dump. Keep it in ordinary data alongside the live entries.
+        terms = query.casefold().split()
+        optional = [
+            entry
+            for entry in entries
+            if (
+                entry.kind in {"finding", "decision"}
+                and any(
+                    term in (entry.metadata["title"] + " " + entry.content).casefold()
+                    for term in terms
+                )
+            )
+            or (checkpoint and entry.metadata["phase"] == checkpoint["phase"])
+        ]
+        optional.sort(key=lambda entry: entry.relevance_score, reverse=True)
+        selected = list(required)
+        if selected and token_length([entry.to_dict() for entry in selected]) > max_tokens:
+            raise ValueError("Open notebook work exceeds recovery budget; review checkpoint")
         if include_continuation and checkpoint and checkpoint.get("continuation"):
-            handoff = _json(checkpoint["continuation"])
-            if len((text + handoff).encode("utf-8")) <= max_tokens:
-                text += handoff
-        seen = set()
-        for entry in selected:
-            if entry["id"] in seen:
+            optional.insert(0, read_checkpoint(checkpoint["continuation"]))
+        seen = {entry.id for entry in selected}
+        for entry in optional:
+            if entry.id in seen:
                 continue
-            seen.add(entry["id"])
-            line = _json(entry)
-            if len((text + line).encode("utf-8")) > max_tokens:
-                if entry["kind"] in {"question", "action"} and entry["status"] == "open":
-                    raise ValueError(
-                        "Open notebook work exceeds recovery budget; review checkpoint"
-                    )
-                continue
-            text += line
-        return text.encode("utf-8")[:max_tokens].decode("utf-8", errors="ignore")
+            seen.add(entry.id)
+            if token_length([item.to_dict() for item in selected + [entry]]) <= max_tokens:
+                selected.append(entry)
+        return selected

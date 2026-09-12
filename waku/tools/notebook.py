@@ -19,7 +19,7 @@ def make_tools(store: NotebookStore) -> list[Tool]:
                 "task_id": string,
                 "entry": {
                     "type": "object",
-                    "description": "kind, title, body, status, phase, source_refs [{type,ref}], confidence, tags. ID/author are assigned by code.",
+                    "description": "ContextPacket input: content, kind, source_refs [string], optional relevance_score and metadata (title, status, phase, tags). ID, task, time and author are assigned by code.",
                 },
             },
             ["task_id", "entry"],
@@ -59,7 +59,11 @@ def make_tools(store: NotebookStore) -> list[Tool]:
 
         def invoke(_method=method, **kwargs):
             value = _method(**kwargs)
-            return value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+            return (
+                value
+                if isinstance(value, str)
+                else json.dumps(value, ensure_ascii=False, default=lambda packet: packet.to_dict())
+            )
 
         tools.append(
             Tool(

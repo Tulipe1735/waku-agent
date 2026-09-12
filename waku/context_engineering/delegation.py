@@ -1,6 +1,9 @@
-"""Short-lived exploration using the existing loop, with explicit resource caps.
+"""
+Subagent delegation
 
-Workers return data; only the caller may commit notebook or continuation state.
+Short-lived exploration using the existing loop, with explicit resource caps.
+
+Workers return data; only the caller may commit notebook state.
 Deadlines revoke future model/tool access. Python cannot interrupt arbitrary
 in-flight tool code, so only trusted, bounded read tools are accepted by default.
 """
@@ -21,6 +24,8 @@ from typing import Any
 
 from waku.loop.agent import run_loop
 from waku.tools.registry import ToolRegistry
+
+from .packet import ContextPacket
 
 _IN_WORKER = contextvars.ContextVar("waku_subagent", default=False)
 _FORBIDDEN = {"delegate_task", "delegate", "delegate_subtasks", "subagent", "spawn_agent"}
@@ -117,114 +122,93 @@ class DelegationPlan:
                 raise ValueError("budgets must be finite and positive")
 
 
-@dataclass
-class SubagentResult:
-    subtask_id: str
-    parent_task_id: str = ""
-    status: str = "success"
-    findings: list[dict[str, Any]] = field(default_factory=list)
-    evidence: list[Any] = field(default_factory=list)
-    uncertainties: list[Any] = field(default_factory=list)
-    failures: list[str] = field(default_factory=list)
-    recommendation: str = ""
-    source_refs: list[str] = field(default_factory=list)
-    input_tokens: int = 0
-    output_tokens: int = 0
-    cost: float = 0
-    latency: float = 0
-    model: str = ""
-    trace_id: str = ""
-    iterations: int = 0
-    deadline: float = 0
-
-    def to_dict(self):
-        if self.status not in {
-            "success",
-            "partial",
-            "failed",
-            "timeout",
-            "cancelled",
-            "budget_exceeded",
-        }:
-            raise ValueError("invalid result status")
-        for name in ("findings", "evidence", "uncertainties", "failures", "source_refs"):
-            if not isinstance(getattr(self, name), list):
-                raise TypeError(f"{name} must be a list")
-        if any(not isinstance(item, str) for item in self.failures + self.source_refs):
-            raise ValueError("failure and source references must be strings")
-        for item in self.findings:
-            if not isinstance(item, dict) or not isinstance(item.get("statement"), str):
-                raise TypeError("finding must have a text statement")
-            refs = item.get("source_refs", [])
-            if not isinstance(refs, list) or any(not isinstance(ref, str) for ref in refs):
-                raise ValueError("finding source_refs must be strings")
-            if item.get("status", "hypothesis") not in {"confirmed", "hypothesis", "rejected"}:
-                raise ValueError("invalid finding status")
-        result = asdict(self)
-        json.dumps(result, allow_nan=False)
-        return result
+def validate_result(packet: ContextPacket) -> None:
+    if packet.kind != "subagent_result":
+        raise ValueError("Expected a subagent_result packet")
+    data = packet.metadata
+    if data.get("status", "success") not in {
+        "success",
+        "partial",
+        "failed",
+        "timeout",
+        "cancelled",
+        "budget_exceeded",
+    }:
+        raise ValueError("invalid result status")
+    for name in ("findings", "evidence", "uncertainties", "failures"):
+        if not isinstance(data.get(name, []), list):
+            raise TypeError(f"{name} must be a list")
+    if any(not isinstance(item, str) for item in data.get("failures", [])):
+        raise ValueError("failures must be strings")
+    for item in data.get("findings", []):
+        if not isinstance(item, dict) or not isinstance(item.get("statement"), str):
+            raise TypeError("finding must have a text statement")
+        refs = item.get("source_refs", [])
+        if not isinstance(refs, list) or any(not isinstance(ref, str) for ref in refs):
+            raise ValueError("finding source_refs must be strings")
+        if item.get("status", "hypothesis") not in {"confirmed", "hypothesis", "rejected"}:
+            raise ValueError("invalid finding status")
+    json.dumps(packet.to_dict(), allow_nan=False)
 
 
-@dataclass
-class AggregationResult:
-    results: list[SubagentResult]
-    findings: list[dict[str, Any]] = field(default_factory=list)
-    evidence: list[Any] = field(default_factory=list)
-    uncertainties: list[Any] = field(default_factory=list)
-    failures: list[str] = field(default_factory=list)
-    conflicts: list[dict[str, Any]] = field(default_factory=list)
-    recommendation: str = ""
-
-    def to_dict(self):
-        return asdict(self)
-
-
-def aggregate_results(results: list[SubagentResult]) -> AggregationResult:
+def aggregate_results(results: list[ContextPacket]) -> ContextPacket:
     """Keep dissent and provenance instead of using last-write-wins."""
-    merged = AggregationResult(results=results)
+    merged = {
+        "results": [],
+        "findings": [],
+        "evidence": [],
+        "uncertainties": [],
+        "failures": [],
+        "conflicts": [],
+    }
     statements: dict[str, dict] = {}
     claims: dict[str, set[str]] = {}
+    task_id = results[0].task_id if results else ""
     for result in results:
-        result.to_dict()
-        merged.failures.extend(f"{result.subtask_id}: {failure}" for failure in result.failures)
-        if result.status not in {"success", "partial"} and not result.failures:
-            merged.failures.append(f"{result.subtask_id}: {result.status}")
-        merged.evidence.extend(result.evidence)
-        merged.uncertainties.extend(result.uncertainties)
-        for finding in result.findings:
+        validate_result(result)
+        if result.task_id != task_id:
+            raise ValueError("Cannot aggregate results from different tasks")
+        data = result.metadata
+        merged["results"].append(result.to_dict())
+        merged["failures"].extend(f"{result.id}: {failure}" for failure in data.get("failures", []))
+        if data.get("status", "success") not in {"success", "partial"} and not data.get("failures"):
+            merged["failures"].append(f"{result.id}: {data['status']}")
+        merged["evidence"].extend(data.get("evidence", []))
+        merged["uncertainties"].extend(data.get("uncertainties", []))
+        for finding in data.get("findings", []):
             item = dict(finding)
-            statement = str(item.get("statement", "")).strip()
+            statement = item["statement"].strip()
             if not statement:
-                merged.uncertainties.append(
-                    {"subtask_id": result.subtask_id, "unparsed_finding": item}
-                )
+                merged["uncertainties"].append({"subtask_id": result.id, "unparsed_finding": item})
                 continue
             normalized = " ".join(statement.casefold().split())
             refs = list(dict.fromkeys(item.get("source_refs", [])))
-            # Evidence-free output stays hypothetical even if the worker claims certainty.
             item["status"] = item.get("status", "hypothesis") if refs else "hypothesis"
             item["source_refs"] = refs
-            item["subtask_ids"] = [result.subtask_id]
+            item["subtask_ids"] = [result.id]
             identity = normalized + "\0" + str(item.get("status"))
             if identity in statements:
                 prior = statements[identity]
                 prior["source_refs"] = list(dict.fromkeys(prior["source_refs"] + refs))
-                prior["subtask_ids"].append(result.subtask_id)
+                prior["subtask_ids"].append(result.id)
             else:
                 statements[identity] = item
             if item.get("key"):
                 claims.setdefault(str(item["key"]), set()).add(statement)
-    merged.findings = list(statements.values())
-    merged.conflicts = [
+    merged["findings"] = list(statements.values())
+    merged["conflicts"] = [
         {"key": key, "statements": sorted(values), "status": "unresolved"}
         for key, values in claims.items()
         if len(values) > 1
     ]
-    merged.uncertainties.extend(merged.conflicts)
-    merged.recommendation = "\n".join(
-        f"{r.subtask_id}: {r.recommendation}" for r in results if r.recommendation
+    merged["uncertainties"].extend(merged["conflicts"])
+    return ContextPacket(
+        content="\n".join(f"{r.id}: {r.content}" for r in results if r.content),
+        kind="aggregation",
+        task_id=task_id,
+        metadata=merged,
+        source_refs=list(dict.fromkeys(ref for result in results for ref in result.source_refs)),
     )
-    return merged
 
 
 class WorkerStopped(RuntimeError):
@@ -316,7 +300,7 @@ class DelegationCoordinator:
             registry = self.tools
         return registry.scoped(task.allowed_tools, before_execute=control.check)
 
-    def run(self, plan: DelegationPlan, cancel_event=None) -> AggregationResult:
+    def run(self, plan: DelegationPlan, cancel_event=None) -> ContextPacket:
         if _IN_WORKER.get():
             raise ValueError("recursive delegation is forbidden")
         event = cancel_event or threading.Event()
@@ -338,21 +322,36 @@ class DelegationCoordinator:
                 control.check()
                 result = self.worker(task, self._scope(task, control), control)
                 control.check()
-                if not isinstance(result, SubagentResult) or result.subtask_id != task.id:
-                    raise ValueError("worker must return matching SubagentResult")
-                result.to_dict()
+                if (
+                    not isinstance(result, ContextPacket)
+                    or result.id != task.id
+                    or result.task_id != task.parent_task_id
+                ):
+                    raise ValueError(
+                        "worker must return a ContextPacket with matching task and subtask IDs"
+                    )
+                validate_result(result)
             except Exception as exc:
-                result = SubagentResult(
-                    task.id, status=getattr(exc, "status", "failed"), failures=[str(exc)]
+                result = ContextPacket(
+                    content="",
+                    id=task.id,
+                    kind="subagent_result",
+                    task_id=plan.parent_task_id,
+                    metadata={"status": getattr(exc, "status", "failed"), "failures": [str(exc)]},
                 )
             finally:
                 _IN_WORKER.reset(marker)
-            result.parent_task_id = plan.parent_task_id
-            result.trace_id, result.model = trace_id, self.model
-            result.latency = time.monotonic() - started
-            result.deadline = time.time() + control.deadline - time.monotonic()
-            result.input_tokens, result.output_tokens = control.input_tokens, control.output_tokens
-            result.cost, result.iterations = control.cost, control.iterations
+            result.metadata.update(
+                status=result.metadata.get("status", "success"),
+                trace_id=trace_id,
+                model=self.model,
+                latency=time.monotonic() - started,
+                deadline=time.time() + control.deadline - time.monotonic(),
+                input_tokens=control.input_tokens,
+                output_tokens=control.output_tokens,
+                cost=control.cost,
+                iterations=control.iterations,
+            )
             result.source_refs = list(dict.fromkeys(task.source_refs + result.source_refs))
             output.put((task.id, result))
 
@@ -375,33 +374,41 @@ class DelegationCoordinator:
                     # Do not schedule replacement work while timed-out Python code
                     # may still be running; revoke access and cancel pending work.
                     control.local_cancel.set()
-                    results[identifier] = SubagentResult(
-                        identifier,
-                        parent_task_id=plan.parent_task_id,
-                        status=status,
-                        failures=[status],
-                        model=self.model,
-                        trace_id=uuid.uuid4().hex,
-                        input_tokens=control.input_tokens,
-                        output_tokens=control.output_tokens,
-                        cost=control.cost,
-                        iterations=control.iterations,
-                        latency=time.monotonic() - control.started,
+                    results[identifier] = ContextPacket(
+                        content="",
+                        id=identifier,
+                        task_id=plan.parent_task_id,
+                        kind="subagent_result",
                         source_refs=control.task.source_refs,
-                        deadline=time.time() + control.deadline - time.monotonic(),
+                        metadata={
+                            "status": status,
+                            "failures": [status],
+                            "model": self.model,
+                            "trace_id": uuid.uuid4().hex,
+                            "input_tokens": control.input_tokens,
+                            "output_tokens": control.output_tokens,
+                            "cost": control.cost,
+                            "iterations": control.iterations,
+                            "latency": time.monotonic() - control.started,
+                            "deadline": time.time() + control.deadline - time.monotonic(),
+                        },
                     )
                     del active[identifier]
                     # Do not launch more workers while an in-flight call may remain.
                     for waiting in pending:
-                        results[waiting.id] = SubagentResult(
-                            waiting.id,
-                            parent_task_id=plan.parent_task_id,
-                            status=status,
-                            failures=["not started after worker deadline/cancellation"],
+                        results[waiting.id] = ContextPacket(
+                            content="",
+                            id=waiting.id,
+                            task_id=plan.parent_task_id,
+                            kind="subagent_result",
                             source_refs=waiting.source_refs,
-                            model=self.model,
-                            trace_id=uuid.uuid4().hex,
-                            deadline=time.time(),
+                            metadata={
+                                "status": status,
+                                "failures": ["not started after worker deadline/cancellation"],
+                                "model": self.model,
+                                "trace_id": uuid.uuid4().hex,
+                                "deadline": time.time(),
+                            },
                         )
                     pending.clear()
         merged = aggregate_results([results[t.id] for t in plan.subtasks])
@@ -412,17 +419,22 @@ class DelegationCoordinator:
                 "parent_task_id": plan.parent_task_id,
                 "results": [
                     {
-                        "subtask_id": r.subtask_id,
-                        "status": r.status,
-                        "trace_id": r.trace_id,
-                        "input_tokens": r.input_tokens,
-                        "output_tokens": r.output_tokens,
-                        "cost": r.cost,
-                        "latency": r.latency,
+                        "subtask_id": r["id"],
+                        **{
+                            key: r["metadata"].get(key)
+                            for key in (
+                                "status",
+                                "trace_id",
+                                "input_tokens",
+                                "output_tokens",
+                                "cost",
+                                "latency",
+                            )
+                        },
                     }
-                    for r in merged.results
+                    for r in merged.metadata["results"]
                 ],
-                "conflicts": len(merged.conflicts),
+                "conflicts": len(merged.metadata["conflicts"]),
             },
         )
         return merged
@@ -510,8 +522,14 @@ class DelegationCoordinator:
             raise ValueError("findings must be objects")
         if not isinstance(data["recommendation"], str):
             raise TypeError("recommendation must be text")
-        return SubagentResult(
-            task.id,
-            status="partial" if data["failures"] else "success",
-            **{key: data[key] for key in _CONTRACT},
+        return ContextPacket(
+            content=data["recommendation"],
+            id=task.id,
+            task_id=task.parent_task_id,
+            kind="subagent_result",
+            source_refs=task.source_refs,
+            metadata={
+                "status": "partial" if data["failures"] else "success",
+                **{key: data[key] for key in _CONTRACT if key != "recommendation"},
+            },
         )

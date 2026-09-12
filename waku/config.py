@@ -79,7 +79,6 @@ class Settings:
     history_turns: int = field(default_factory=lambda: int(os.getenv("WAKU_HISTORY_TURNS", "12")))
 
     # Independent opt-ins preserve baseline behavior and enable ablations.
-    context_continuation: bool = field(default_factory=lambda: os.getenv("WAKU_CONTEXT_CONTINUATION", "0") == "1")
     context_notebook: bool = field(default_factory=lambda: os.getenv("WAKU_CONTEXT_NOTEBOOK", "0") == "1")
     context_subagents: bool = field(default_factory=lambda: os.getenv("WAKU_CONTEXT_SUBAGENTS", "0") == "1")
 

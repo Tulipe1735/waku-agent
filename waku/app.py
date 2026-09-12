@@ -33,8 +33,7 @@ class Waku:
         self.session = Session(self.settings, memory=self.memory)
         self.tracer = Tracer(self.settings)
         self.context = None
-        if (self.settings.context_continuation or self.settings.context_notebook
-                or self.settings.context_subagents):
+        if (self.settings.context_notebook or self.settings.context_subagents):
             from waku.context_engineering.runtime import ContextRuntime
             self.context = ContextRuntime(self.settings, self.client, self.tools)
 

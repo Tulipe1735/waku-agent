@@ -1,31 +1,20 @@
-from dataclasses import replace
-
 import pytest
 
+from waku.context_engineering import ContextPacket
 from waku.context_engineering.compaction import compact_history, compile_continuation
-from waku.context_engineering.continuation import Continuation, ContinuationStore
 
 
-def test_checkpoint_chain_and_failure_preserves_valid_state(tmp_path):
-    store = ContinuationStore(tmp_path)
-    first = Continuation(
-        task_id="task",
-        objective="Debug deployment",
-        constraints=["Do not deploy"],
-        open_questions=["Why timeout?"],
-        next_actions=["Inspect logs"],
+def checkpoint_packet(task_id, **state):
+    return ContextPacket(
+        content=state["objective"],
+        task_id=task_id,
+        kind="continuation",
+        metadata={"status": "active", "current_phase": "init", **state},
     )
-    store.save(first)
-    second = replace(first, checkpoint_id="second", parent_checkpoint_id=first.checkpoint_id)
-    store.save(second)
-    assert store.latest("task") == second
-    with pytest.raises(ValueError):
-        store.save(replace(second, checkpoint_id="third", parent_checkpoint_id="missing"))
-    assert store.latest("task") == second
 
 
 def test_compiler_rejects_invented_confirmation_and_keeps_previous():
-    first = Continuation(
+    first = checkpoint_packet(
         task_id="task",
         objective="Research",
         facts=[{"statement": "Cache issue", "status": "hypothesis", "source_refs": ["message:1"]}],
@@ -35,13 +24,13 @@ def test_compiler_rejects_invented_confirmation_and_keeps_previous():
 
     def corrupt(payload):
         candidate = first.to_dict()
-        candidate["facts"][0]["status"] = "confirmed"
+        candidate["metadata"]["facts"][0]["status"] = "confirmed"
         return candidate
 
     result = compile_continuation(
         state, [{"role": "user", "content": "Continue"}], [], first, summarizer=corrupt
     )
-    assert result.continuation == first
+    assert result.packet == first
     assert result.fallback and result.warnings
 
 
@@ -85,29 +74,31 @@ def test_compilation_retains_critical_fields_over_twenty_turns():
         "done": ["Collected logs"],
     }
     result = compile_continuation(state, history, [], None)
-    assert result.continuation.objective == "Resolve outage"
-    assert result.continuation.constraints == ["No restart"]
-    assert result.continuation.open_questions == ["Why lock?"]
-    assert result.continuation.next_actions == ["Inspect owner"]
+    assert result.packet.metadata["objective"] == "Resolve outage"
+    assert result.packet.metadata["constraints"] == ["No restart"]
+    assert result.packet.metadata["open_questions"] == ["Why lock?"]
+    assert result.packet.metadata["next_actions"] == ["Inspect owner"]
 
 
 @pytest.mark.parametrize("field", ["done", "artifacts", "risks", "status", "current_phase"])
 def test_summarizer_cannot_drop_task_state(field):
-    original = Continuation(
+    original = checkpoint_packet(
         task_id="task", objective="Fix", done=["Read logs"], artifacts=["log.txt"], risks=["Race"]
     )
 
     def summarize(payload):
         candidate = payload["state"]
-        candidate[field] = [] if isinstance(candidate[field], list) else "complete"
+        candidate["metadata"][field] = (
+            [] if isinstance(candidate["metadata"][field], list) else "complete"
+        )
         return candidate
 
     result = compile_continuation({}, [], [], original, summarize)
-    assert result.fallback and result.continuation == original
+    assert result.fallback and result.packet == original
 
 
 def test_summarizer_cannot_swap_real_source_for_another_real_source():
-    original = Continuation(
+    original = checkpoint_packet(
         task_id="task",
         objective="Fix",
         facts=[{"statement": "Race", "status": "hypothesis", "source_refs": ["message:0"]}],
@@ -115,7 +106,7 @@ def test_summarizer_cannot_swap_real_source_for_another_real_source():
 
     def summarize(payload):
         candidate = payload["state"]
-        candidate["facts"][0]["source_refs"] = ["message:1"]
+        candidate["metadata"]["facts"][0]["source_refs"] = ["message:1"]
         return candidate
 
     result = compile_continuation(
@@ -126,29 +117,6 @@ def test_summarizer_cannot_swap_real_source_for_another_real_source():
         summarize,
     )
     assert result.fallback
-
-
-def test_latest_corrupt_checkpoint_recovers_committed_parent_not_orphan(tmp_path):
-    store = ContinuationStore(tmp_path)
-    first = Continuation(task_id="task", objective="Fix")
-    store.save(first)
-    second = replace(first, checkpoint_id="second", parent_checkpoint_id=first.checkpoint_id)
-    store.save(second)
-    (tmp_path / "task/second.json").write_text("broken")
-    orphan = replace(second, checkpoint_id="orphan")
-    import json
-
-    (tmp_path / "task/orphan.json").write_text(json.dumps(orphan.to_dict()))
-    assert store.latest("task") == first
-
-
-def test_latest_corrupt_manifest_recovers_previous_committed_head(tmp_path):
-    store = ContinuationStore(tmp_path)
-    first = Continuation(task_id="task", objective="Fix")
-    store.save(first)
-    store.save(replace(first, checkpoint_id="second", parent_checkpoint_id=first.checkpoint_id))
-    (tmp_path / "task/latest.json").write_text("broken")
-    assert store.latest("task") == first
 
 
 def test_deterministic_digest_preserves_user_request_and_tool_failures():
@@ -173,7 +141,7 @@ def test_deterministic_digest_preserves_user_request_and_tool_failures():
         },
     ]
     result = compile_continuation({"task_id": "task", "objective": "Inspect"}, history, [])
-    digest = result.continuation.recent_turn_digest
+    digest = result.packet.content
     assert "msg-1" in digest and "without changing files" in digest
     assert "run-1" in digest and "Permission denied" in digest
 
@@ -184,8 +152,8 @@ def test_large_optional_digest_does_not_force_fallback():
         [{"role": "user", "content": "要求" * 9000}],
         [],
     )
-    from waku.context_engineering.continuation import token_length
+    from waku.context_engineering.packet import token_length
 
     assert not result.fallback
-    assert token_length(result.continuation.to_dict()) <= 3000
+    assert token_length(result.packet.to_dict()) <= 3000
     assert result.retained_history[0]["content"] == "要求" * 9000

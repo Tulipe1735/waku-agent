@@ -7,14 +7,20 @@ from types import SimpleNamespace
 
 import pytest
 
+from waku.context_engineering import ContextPacket
 from waku.context_engineering.delegation import (
     DelegationCoordinator,
     DelegationPlan,
-    SubagentResult,
     Subtask,
     SubtaskBudget,
 )
 from waku.tools.registry import Tool, ToolRegistry
+
+
+def worker_packet(subtask_id, **metadata):
+    return ContextPacket(
+        content="", id=subtask_id, task_id="parent", kind="subagent_result", metadata=metadata
+    )
 
 
 def task(name, **kwargs):
@@ -25,7 +31,7 @@ def test_partial_failure_dedup_and_conflicts():
     def worker(t, tools, control):
         if t.id == "bad":
             raise RuntimeError("worker failed")
-        return SubagentResult(
+        return worker_packet(
             subtask_id=t.id,
             findings=[
                 {"statement": "same fact", "source_refs": [t.id]},
@@ -36,10 +42,10 @@ def test_partial_failure_dedup_and_conflicts():
     result = DelegationCoordinator(worker=worker).run(
         DelegationPlan("parent", [task("yes"), task("no"), task("bad")])
     )
-    assert len(result.results) == 3
-    assert len(result.findings) == 3
-    assert result.conflicts[0]["key"] == "answer"
-    assert result.failures
+    assert len(result.metadata["results"]) == 3
+    assert len(result.metadata["findings"]) == 3
+    assert result.metadata["conflicts"][0]["key"] == "answer"
+    assert result.metadata["failures"]
     json.dumps(result.to_dict())
 
 
@@ -72,13 +78,13 @@ def test_timeout_cancel_and_concurrency():
     )
     assert time.monotonic() - start < 1
     assert peak <= 2
-    assert all(r.status == "timeout" for r in result.results)
+    assert all(r["metadata"]["status"] == "timeout" for r in result.metadata["results"])
     event = threading.Event()
     event.set()
     cancelled = DelegationCoordinator(worker=worker).run(
         DelegationPlan("parent", [task("one")]), cancel_event=event
     )
-    assert cancelled.results[0].status == "cancelled"
+    assert cancelled.metadata["results"][0]["metadata"]["status"] == "cancelled"
 
 
 def test_scoped_tools_deny_write_and_recursive_delegation():
@@ -90,12 +96,12 @@ def test_scoped_tools_deny_write_and_recursive_delegation():
     def worker(t, tools, control):
         seen.extend(s["name"] for s in tools.schemas())
         assert "unknown tool" in tools.execute("write", {})
-        return SubagentResult(subtask_id=t.id)
+        return worker_packet(subtask_id=t.id)
 
     coordinator = DelegationCoordinator(tools=registry, worker=worker, read_only_tools={"read"})
     result = coordinator.run(DelegationPlan("parent", [task("one", allowed_tools=["read"])]))
     assert seen == ["read"]
-    assert result.results[0].status == "success"
+    assert result.metadata["results"][0]["metadata"]["status"] == "success"
     for name in ("write", "delegate_task"):
         with pytest.raises(ValueError):
             coordinator.run(DelegationPlan("parent", [task("one", allowed_tools=[name])]))
@@ -138,24 +144,24 @@ def test_loop_worker_budget_prevents_provider_call():
     coordinator = DelegationCoordinator(client=client, model="fake")
     result = coordinator.run(DelegationPlan("parent", [task("one")], max_tokens=1))
     assert not calls
-    assert result.results[0].status == "budget_exceeded"
+    assert result.metadata["results"][0]["metadata"]["status"] == "budget_exceeded"
     result = coordinator.run(DelegationPlan("parent", [task("two")]))
     assert len(calls) == 1
-    assert result.results[0].input_tokens == 10
-    assert result.results[0].trace_id
+    assert result.metadata["results"][0]["metadata"]["input_tokens"] == 10
+    assert result.metadata["results"][0]["metadata"]["trace_id"]
 
 
 def test_recursion_and_malformed_result_are_visible_failures():
     def worker(t, tools, control):
         if t.id == "recursive":
             DelegationCoordinator(worker=worker).run(DelegationPlan("parent", [task("child")]))
-        return SubagentResult(t.id, findings=[{"statement": "bad", "source_refs": [{}]}])
+        return worker_packet(t.id, findings=[{"statement": "bad", "source_refs": [{}]}])
 
     result = DelegationCoordinator(worker=worker).run(
         DelegationPlan("parent", [task("recursive"), task("malformed")])
     )
-    assert [r.status for r in result.results] == ["failed", "failed"]
-    assert "recursive delegation" in result.failures[0]
+    assert [r["metadata"]["status"] for r in result.metadata["results"]] == ["failed", "failed"]
+    assert "recursive delegation" in result.metadata["failures"][0]
 
 
 def test_global_budget_is_reserved_before_concurrent_calls():
@@ -164,19 +170,25 @@ def test_global_budget_is_reserved_before_concurrent_calls():
     def worker(t, tools, control):
         control.reserve(60)
         entered.append(t.id)
-        return SubagentResult(t.id)
+        return worker_packet(t.id)
 
     result = DelegationCoordinator(worker=worker, token_cost=0.001).run(
         DelegationPlan("parent", [task("one"), task("two")], max_tokens=100, max_cost=1)
     )
     assert len(entered) == 1
-    assert sorted(r.status for r in result.results) == ["budget_exceeded", "success"]
+    assert sorted(r["metadata"]["status"] for r in result.metadata["results"]) == [
+        "budget_exceeded",
+        "success",
+    ]
     entered.clear()
     result = DelegationCoordinator(worker=worker, token_cost=0.001).run(
         DelegationPlan("parent", [task("one"), task("two")], max_tokens=1000, max_cost=0.1)
     )
     assert len(entered) == 1
-    assert sorted(r.status for r in result.results) == ["budget_exceeded", "success"]
+    assert sorted(r["metadata"]["status"] for r in result.metadata["results"]) == [
+        "budget_exceeded",
+        "success",
+    ]
 
 
 def test_fake_provider_reuses_loop_and_stops_at_iteration_limit():
@@ -213,8 +225,8 @@ def test_fake_provider_reuses_loop_and_stops_at_iteration_limit():
         )
     )
     assert len(count) == 8
-    assert result.results[0].status == "failed"
-    assert result.results[0].iterations == 8
+    assert result.metadata["results"][0]["metadata"]["status"] == "failed"
+    assert result.metadata["results"][0]["metadata"]["iterations"] == 8
 
 
 def test_expired_worker_cannot_execute_tools_after_return():
@@ -228,7 +240,7 @@ def test_expired_worker_cannot_execute_tools_after_return():
         release.wait(1)
         try:
             assert "cancelled" in tools.execute("read", {})
-            return SubagentResult(t.id)
+            return worker_packet(t.id)
         finally:
             finished.set()
 
@@ -239,7 +251,7 @@ def test_expired_worker_cannot_execute_tools_after_return():
             [task("one", allowed_tools=["read"], budget=SubtaskBudget(timeout_seconds=0.02))],
         )
     )
-    assert result.results[0].status == "timeout"
+    assert result.metadata["results"][0]["metadata"]["status"] == "timeout"
     release.set()
     assert finished.wait(1)
     assert not executed

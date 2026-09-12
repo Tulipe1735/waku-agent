@@ -1,7 +1,13 @@
 import json
 
 from evals.helpers import ScriptedClient, make_waku, response, text_block
+from waku.context_engineering.notebook import read_checkpoint
 from waku.context_engineering.runtime import ContextRuntime
+
+
+def latest_state(app):
+    task = app.context.task_id(app.session.session_id)
+    return read_checkpoint(app.context.notebook.read(task)["checkpoint"]["continuation"])
 
 
 def test_resume_is_user_data_and_retrieval_still_runs(tmp_path):
@@ -19,7 +25,6 @@ def test_resume_is_user_data_and_retrieval_still_runs(tmp_path):
     app = make_waku(
         tmp_path / "home",
         client=client,
-        context_continuation=True,
         context_notebook=True,
         consolidate_every=100,
     )
@@ -36,11 +41,11 @@ def test_resume_is_user_data_and_retrieval_still_runs(tmp_path):
     app.respond("Continue")
     assert "Never deploy" not in client.sent["system"]
     assert "Never deploy" in str(client.sent["messages"])
-    assert app.context.store.latest(app.context.task_id("default")).objective == "Resolve outage"
+    assert latest_state(app).metadata["objective"] == "Resolve outage"
 
 
 def test_session_switch_cannot_leak_task_checkpoint(tmp_path):
-    app = make_waku(tmp_path / "home", client=ScriptedClient([]), context_continuation=True)
+    app = make_waku(tmp_path / "home", client=ScriptedClient([]), context_notebook=True)
     app.context.checkpoint(app.session, {"objective": "Private project A"}, event="milestone")
     app.session.start_new("B")
     messages = app.context.prepare(app.session, "Hello")
@@ -52,7 +57,7 @@ def test_checkpoint_failure_keeps_answer_and_is_visible(tmp_path, monkeypatch):
         response([text_block('{"retrieve":false,"query":"","reason":"test"}')]),
         response([text_block("The answer")]),
     ]
-    app = make_waku(tmp_path / "home", client=ScriptedClient(script), context_continuation=True)
+    app = make_waku(tmp_path / "home", client=ScriptedClient(script), context_notebook=True)
     monkeypatch.setattr(
         ContextRuntime, "checkpoint", lambda *a, **kw: (_ for _ in ()).throw(OSError("disk"))
     )
@@ -79,7 +84,7 @@ def test_long_tool_result_retains_final_error_and_ids(tmp_path):
             response([text_block("Observed")]),
         ]
     )
-    app = make_waku(tmp_path / "home", client=client, context_continuation=True)
+    app = make_waku(tmp_path / "home", client=client, context_notebook=True)
     from waku.tools.registry import Tool
 
     app.tools.register(
@@ -97,7 +102,6 @@ def test_twenty_five_turn_handoff_preserves_task_state(tmp_path):
     app = make_waku(
         tmp_path / "home",
         client=client,
-        context_continuation=True,
         context_notebook=True,
         consolidate_every=100000,
     )
@@ -122,10 +126,8 @@ def test_twenty_five_turn_handoff_preserves_task_state(tmp_path):
     messages = app.context.prepare(app.session, "Continue investigation")
     for text in ("Fix outage", "No deployment", "Why lock?", "Inspect owner", "Collected logs"):
         assert text in str(messages)
-    current = app.context.store.latest(app.context.task_id("default"))
-    assert current.parent_checkpoint_id and any(
-        ref.startswith("notebook:") for ref in current.artifacts
-    )
+    current = latest_state(app)
+    assert current.metadata["parent_checkpoint_id"]
 
 
 def test_project_tool_bodies_are_not_copied_into_traces_or_memory(tmp_path):
