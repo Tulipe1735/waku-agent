@@ -108,17 +108,30 @@ Continuation、notebook 和子代理结果仅作为普通用户消息中的项�
 
 Python 无法强制终止已经进入的任意同步工具代码：deadline 会撤销后续模型/工具访问，并停止启动排队 worker；已经运行的调用可能稍后返回。因此默认只授权有界只读工具，外部写操作应使用具备自身取消机制的受控实现。graph/gather 的固定拓扑和“只提案、不执行”规则保持原样。
 
-## 测试
-
-上下文测试全部离线运行，不调用 provider：
+## 评测复现
 
 ```bash
-python -m pytest -q evals/deterministic/test_context_packet.py \
-  evals/deterministic/test_context_assembly.py \
-  evals/deterministic/test_context_continuation.py \
-  evals/deterministic/test_context_runtime.py \
-  evals/deterministic/test_context_notebook.py \
-  evals/deterministic/test_context_delegation.py
+python -m waku.ops.context_eval --dataset evals/context.jsonl \
+  --variants baseline,optimized,notebook-only,subagent-only,all-on \
+  --output .waku/evals/context
+
+python -m waku.ops.context_eval --case-id workers-001 --variants optimized --hard-gate
+python -m pytest -q evals/deterministic/test_context_runtime.py \
+  evals/deterministic/test_context_delegation.py evals/deterministic/test_context_eval.py
 ```
 
-覆盖 packet 序列化与预算选择、compaction 的确定性整轮裁剪与来源校验、运行时恢复（含失败回退）、notebook 存储与工具边界、子代理预算/隔离/汇聚。模型整合是可注入的第二步，默认走不产生额外模型调用的确定性路径；注入的 summarizer 无法改写受保护字段或凭空确认结论。真实模型质量评测不在本仓库的确定性 gate 内。
+包含 25 轮调试、多阶段研究、工具重试、目标改变、worker 重复/冲突/失败、人工修改笔记、闲聊和超长工具输出。`CaptureClient` 在真实 Waku provider 边界冻结每次调用的 system/messages/tools；baseline 没有人工简化 prompt。不同 variant 使用相同 fixture 的历史和权威任务状态；gold 只用于评分，测试明确禁止 gold 注入模型输入。
+
+默认离线 scripted provider 只用于执行真实输入组装、工具循环和协调器，不伪造自然语言任务回答。notebook 是唯一持久化存储，优化比较依赖 fixture 提供的权威 checkpoint 状态，不能据此证明模型能自行从任意长对话准确抽取全部状态。报告中的字面保留率也不是语义任务成功率。
+
+真实模型与 judge 是显式选项（会调用已配置 provider）：
+
+```bash
+python -m waku.ops.context_eval --variants baseline,optimized --live-agent --judge
+```
+
+Judge 每项至少执行两次，严格校验 JSON 字段、0–4 分数、有限数值和重复键，输出方差。未配置、调用失败或返回非法 JSON 时记录 unavailable，同时继续确定性检查。私有 fixture 默认不得发送到远端 agent/judge，磁盘报告只保留 artifact 哈希与长度；公开测试数据须显式标记 `privacy: public-synthetic`。只有显式 `--allow-private-remote` 才能放行私有 fixture 的外发，并在报告中记录授权事实。
+
+报告含逐 case/variant、质量维度及 delta、均值/p50/p95、保留率、worker 成败与汇聚覆盖、模型实际 usage（可用时）、现有 pricing 表的估算成本、延迟、长度、judge 版本/模型/方差及 fixture 哈希。离线 token/成本/语义评分为 null。judge 输出不会写入用户长期记忆。
+
+`test_optimized_fixtures_meet_release_hard_gate` 已加入原有 deterministic suite，因此既有 release gate 自动执行关键上下文检查，无需网络或 judge。
