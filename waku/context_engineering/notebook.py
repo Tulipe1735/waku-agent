@@ -430,6 +430,10 @@ class NotebookStore:
                 raise ValueError("Unknown checkpoint entry id")
             if isinstance(continuation, ContextPacket):
                 continuation = continuation.to_dict()
+            if continuation is None and parent:
+                # A plain checkpoint snapshots entries, not task state. Task
+                # state only moves through its own explicit checkpoint.
+                continuation = parent.get("continuation")
             sequence = int(parent["checkpoint_id"].split("-")[0]) + 1 if parent else 1
             checkpoint_id = f"{sequence:08d}-{uuid4().hex[:12]}"
             value = {
@@ -506,7 +510,10 @@ class NotebookStore:
         if selected and token_length([entry.to_dict() for entry in selected]) > max_tokens:
             raise ValueError("Open notebook work exceeds recovery budget; review checkpoint")
         if include_continuation and checkpoint and checkpoint.get("continuation"):
-            optional.insert(0, read_checkpoint(checkpoint["continuation"]))
+            # Task state is pinned here too: the unified assembly layer owns the
+            # final budget and reports over_budget instead of losing it to a
+            # pre-filter that can only see notebook packets.
+            selected.insert(0, read_checkpoint(checkpoint["continuation"]))
         seen = {entry.id for entry in selected}
         for entry in optional:
             if entry.id in seen:

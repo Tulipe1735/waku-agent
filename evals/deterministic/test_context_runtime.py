@@ -10,6 +10,14 @@ def latest_state(app):
     return read_checkpoint(app.context.notebook.read(task)["checkpoint"]["continuation"])
 
 
+def test_notebook_enables_checkpoint_tool(tmp_path):
+    app = make_waku(tmp_path / "home", client=ScriptedClient([]), context_notebook=True)
+    names = {schema["name"] for schema in app.tools.schemas()}
+    assert {"notebook_append", "notebook_checkpoint", "context_checkpoint"} <= names
+    plain = make_waku(tmp_path / "plain", client=ScriptedClient([]))
+    assert "context_checkpoint" not in {schema["name"] for schema in plain.tools.schemas()}
+
+
 def test_resume_is_user_data_and_retrieval_still_runs(tmp_path):
     class Recorder(ScriptedClient):
         def _create(self, **kwargs):

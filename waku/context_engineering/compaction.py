@@ -10,7 +10,7 @@ import hashlib
 import json
 from dataclasses import dataclass, field
 
-from .continuation import validate_checkpoint
+from .notebook import validate_checkpoint
 from .packet import ContextPacket, token_length
 
 

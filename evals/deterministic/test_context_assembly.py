@@ -95,6 +95,27 @@ def test_assemble_empty_input_is_empty():
     assert result.token_length == token_length([])
 
 
+def test_runtime_prepare_pins_continuation_above_notebook_budget(tmp_path):
+    app = make_waku(tmp_path / "home", client=ScriptedClient([]), context_notebook=True)
+    task = app.context.task_id(app.session.session_id)
+    app.context.checkpoint(app.session, {"objective": "O" * 900, "constraints": ["C" * 400]})
+    app.context.notebook.append(
+        task, {"kind": "question", "content": "Q" * 2300, "metadata": {"status": "open"}}
+    )
+    events = []
+    messages = app.context.prepare(
+        app.session, "What next?", notify=lambda kind, event: events.append((kind, event))
+    )
+    payload = json.loads(messages[0]["content"].split("\n", 1)[1])
+    assert [ContextPacket.from_dict(item).kind for item in payload["packets"]] == [
+        "continuation",
+        "question",
+    ]
+    restore = next(event for kind, event in events if kind == "context_restore")
+    assert restore["over_budget"] is False
+    assert restore["dropped_packets"] == []
+
+
 def test_runtime_prepare_orders_and_budgets_packets(tmp_path):
     app = make_waku(
         tmp_path / "home",

@@ -6,6 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 
 from waku.context_engineering.notebook import NotebookStore
+from waku.context_engineering.packet import ContextPacket, token_length
 from waku.tools.notebook import make_tools
 from waku.tools.registry import ToolRegistry
 
@@ -137,6 +138,51 @@ def test_recovery_is_bounded_and_prioritizes_open_work(tmp_path):
     context = store.resume_context("task", max_tokens=500)
     assert "Need owner" in str(context)
     assert len(json.dumps([packet.to_dict() for packet in context]).encode()) <= 500
+
+
+def test_plain_checkpoint_inherits_previous_continuation(tmp_path):
+    store = NotebookStore(tmp_path)
+    store.create("task")
+    state = ContextPacket(
+        content="digest",
+        task_id="task",
+        kind="continuation",
+        metadata={
+            "objective": "Fix outage",
+            "constraints": ["No deployment"],
+            "status": "active",
+            "current_phase": "init",
+        },
+    )
+    store.checkpoint("task", continuation=state)
+    latest = store.checkpoint("task", phase="review")
+    assert latest["phase"] == "review"
+    assert latest["continuation"] == state.to_dict()
+
+
+def test_resume_context_protects_continuation_from_prefilter(tmp_path):
+    store = NotebookStore(tmp_path)
+    store.create("task")
+    continuation = ContextPacket(
+        content="digest",
+        task_id="task",
+        kind="continuation",
+        relevance_score=1.0,
+        metadata={
+            "objective": "O" * 2600,
+            "constraints": ["C" * 1000],
+            "status": "active",
+            "current_phase": "init",
+        },
+    )
+    store.checkpoint("task", continuation=continuation)
+    store.append(
+        "task", {"kind": "question", "content": "Q" * 700, "metadata": {"status": "open"}}
+    )
+    context = store.resume_context("task", query="")
+    assert [packet.kind for packet in context] == ["continuation", "question"]
+    protected = token_length([packet.to_dict() for packet in context])
+    assert 4000 < protected < 6000
 
 
 def test_corrupt_checkpoint_falls_back_and_failed_temp_is_ignored(tmp_path):
